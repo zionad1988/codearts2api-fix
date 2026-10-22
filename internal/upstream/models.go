@@ -313,7 +313,11 @@ func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 		sets = append(sets, infos)
 	}
 	benefitOK := false
-	if infos, err := c.fetchBenefitModels(accountID, cred); err != nil {
+	// 先问总开关，确认关闭就整体跳过：渠道没开通时 claim 与 config 都只会回
+	// 4000 invalid channel, group not found，白打两次请求还刷两条误导性日志。
+	if c.benefitGatewayClosed(accountID, cred) {
+		Log("benefit gateway disabled for account %s: skip claim/config", accountID)
+	} else if infos, err := c.fetchBenefitModels(accountID, cred); err != nil {
 		Log("benefit models: %v", err)
 	} else {
 		benefitOK = true
@@ -509,6 +513,102 @@ func (c *Client) ClaimBenefit(cred SignCredential) error {
 	return nil
 }
 
+// benefitGatewayClosed 问上游：这个账号的福利网关开没开。
+//
+// `GET {snap}/v1/benefit-gateway-config` → `{"enabled": bool, ...}`，是官方
+// 设计里的总开关：未开通时 opengw 的 claim / config / balance 一律回 4000
+// invalid channel, group not found。先读开关，关了就不去撞那几个接口——判断
+// 依据从「猜 error_msg」变成「读上游的明确字段」。
+//
+// 查询本身失败（网络/签名）时返回 false：这只是「问不到」，不代表渠道关闭，
+// 让后续流程按原样走并如实报错，不要因为一次网络抖动就把福利模型永久关掉。
+//
+// 结果按账号记忆（渠道是按账号下线的）：一旦确认关闭就不再重复询问。
+func (c *Client) benefitGatewayClosed(accountID string, cred SignCredential) bool {
+	if accountID == "" {
+		return false
+	}
+	c.srcMu.Lock()
+	_, down := c.benefitDown[accountID]
+	c.srcMu.Unlock()
+	if down {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.snapURL(EpBenefitGatewayConfig), nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Agent-Type", "PromptCenter")
+	req.Header.Set("X-Language", "zh-cn")
+	if cred.SecurityToken != "" {
+		req.Header.Set("X-Security-Token", cred.SecurityToken)
+	}
+	signRequest(req, []byte{}, cred)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		Log("benefit-gateway-config: %v（按未关闭继续）", err)
+		return false
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		Log("benefit-gateway-config: HTTP %d（按未关闭继续）", resp.StatusCode)
+		return false
+	}
+	// 该接口返回裸对象（没有 {code,data} 信封），直接取 enabled。
+	var out struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		Log("benefit-gateway-config: parse %v（按未关闭继续）", err)
+		return false
+	}
+	if out.Enabled {
+		return false
+	}
+	c.srcMu.Lock()
+	if c.benefitDown == nil {
+		c.benefitDown = map[string]bool{}
+	}
+	c.benefitDown[accountID] = true
+	c.srcMu.Unlock()
+	return true
+}
+
+// NoteBenefitChannelDown 记住「该账号的福利渠道未开通」。渠道下线是终态，
+// 首次从上游错误里识别后就不再每轮重试 claim/config 并刷警告。
+func (c *Client) NoteBenefitChannelDown(accountID string) {
+	if accountID == "" {
+		return
+	}
+	c.srcMu.Lock()
+	if c.benefitDown == nil {
+		c.benefitDown = map[string]bool{}
+	}
+	already := c.benefitDown[accountID]
+	c.benefitDown[accountID] = true
+	c.srcMu.Unlock()
+	if !already {
+		Log("account %s: benefit channel closed (invalid channel/group not found), 后续同步将跳过 opengw", accountID)
+	}
+}
+
+// isChannelDown 判断错误是不是「权益渠道未开通」，而不是网络/签名问题。
+//
+// 上游把渠道问题也塞在 4000 码里，光看码会与「参数错误」混淆；判据只能是
+// error_msg 里的渠道字样（签名错会是 APIG.0301，不会落到这里）。这是**兜底
+// 判据**：正常路径应当先问 benefitGatewayClosed，别靠解析错误文案猜渠道状态。
+func isChannelDown(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "invalid channel") || strings.Contains(message, "group not found")
+}
+
 // fetchBenefitModels 拉取限时福利模型（gateway/config），返回结果整体标记 Benefit。
 func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]ModelInfo, error) {
 	key := accountID + "|benefit"
@@ -517,6 +617,11 @@ func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]Mo
 	}
 	if c.claimAuto.Load() {
 		if err := c.ClaimBenefit(cred); err != nil {
+			if isChannelDown(err) {
+				// 总开关说开着、实际却回 invalid channel：以实际上游行为准。
+				c.NoteBenefitChannelDown(accountID)
+				return nil, err
+			}
 			Log("benefit claim: %v", err)
 		}
 	}
@@ -561,6 +666,10 @@ func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]Mo
 		return nil, fmt.Errorf("parse benefit config: %w", err)
 	}
 	if out.ErrorCode != "0000" {
+		if isChannelDown(fmt.Errorf("gateway/config error_code=%s", out.ErrorCode)) {
+			c.NoteBenefitChannelDown(accountID)
+			return nil, fmt.Errorf("gateway/config error_code=%s", out.ErrorCode)
+		}
 		c.noteSrcFail(key)
 		return nil, fmt.Errorf("gateway/config error_code=%s", out.ErrorCode)
 	}

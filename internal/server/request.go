@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"codearts2api/internal/upstream"
 )
 
 // openAIToolCall 一次函数调用（assistant 历史或响应里用）。
@@ -92,6 +94,14 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 	}
 	if req.MaxTokens != nil && *req.MaxTokens <= 0 {
 		return nil, errors.New("max_tokens must be greater than 0")
+	}
+	// 上游对 max_tokens 有硬上限：超出时 InferHub 不返回 4xx，而是在已建立的
+	// SSE 流里塞 InferHub.001001005.400 错误帧，Agent 客户端会当成空响应无限
+	// 重试。云端下发的 model_parameters.max_tokens 是上下文口径（131072+），
+	// 客户端照抄必然全量失败，因此必须在转发前钳制。
+	if req.MaxTokens != nil && *req.MaxTokens > upstream.MaxOutputTokens {
+		capped := upstream.MaxOutputTokens
+		req.MaxTokens = &capped
 	}
 	if req.Temperature != nil && (*req.Temperature < 0 || *req.Temperature > 2) {
 		return nil, errors.New("temperature must be between 0 and 2")

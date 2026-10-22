@@ -34,6 +34,17 @@ const (
 	BenefitHost     = "https://opengw.developer.huaweicloud.com"
 	EpBenefitConfig = "/api/v1/gateway/config"
 	EpBenefitClaim  = "/api/v1/benefit/claim"
+	// 福利网关总开关。注意它挂在 snap-access 域，不 opengw 域
+	// （opengw 上该路径是 404 APIG.0101）。返回裸对象 {"enabled": bool}，
+	// 没有 {code,data} 信封。未开通时 opengw 的 claim/config/balance 一律回
+	// 4000 invalid channel, group not found。
+	EpBenefitGatewayConfig = "/v1/benefit-gateway-config"
+
+	// MaxOutputTokens 上游 InferHub 接受的 max_tokens 硬上限（实测 65536 通过、
+	// 66560 起整请求被拒，报流内错误帧 InferHub.001001005.400 "The request param
+	// is invalid"）。AgentCenter/opengw 下发的 model_parameters.max_tokens 是上下文
+	// 口径的值（131072 起），客户端读到后照抄发送必然全量失败。
+	MaxOutputTokens = 65536
 
 	// 登录/令牌
 	EpLoginTicket    = "/v1/login/ticket"

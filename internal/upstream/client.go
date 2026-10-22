@@ -123,6 +123,9 @@ type Client struct {
 	// 避免每次 /v1/models 刷新都空等超时。
 	srcMu   sync.Mutex
 	srcFail map[string]time.Time
+	// benefitDown 已确认福利渠道未开通的账号（accountID -> true）。渠道按账号
+	// 下线，是终态不是偶发：记住后不再每轮同步重试 claim/config 并刷警告。
+	benefitDown map[string]bool
 }
 
 // srcFailCooldown 上游某一来源连续失败后的退避窗口。

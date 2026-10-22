@@ -267,3 +267,172 @@ func TestFetchModelsMergesSourcesAndGatesClaim(t *testing.T) {
 		t.Fatalf("关闭自动领取后不应再提交 claim，claims=%d", gotClaims)
 	}
 }
+
+// 福利网关总开关关闭时，claim/config 一次都不该发（对齐 Python 版 T13）。
+func TestBenefitGatewayClosedSkipsOpengw(t *testing.T) {
+	var mu sync.Mutex
+	var opengwCalls []string
+	var gateCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/benefit-gateway-config":
+			mu.Lock()
+			gateCalls++
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"enabled":false,"is_examination_domain":false}`)
+		case "/v1/agent-center/agents/useragents":
+			_, _ = io.WriteString(w, `{"agents":[{"agent_id":"a1","is_primary_agent":true}]}`)
+		case "/v1/agent-center/agents/detail":
+			_, _ = io.WriteString(w, `{"gpts":{"models":[{"model_name":"GLM-5.2","model_parameters":{"context_window":202752}}]}}`)
+		case "/v1/model/builtin":
+			_, _ = io.WriteString(w, `{"builtinModels":[{"model_id":"Qwen3-VL-235B"}]}`)
+		default:
+			mu.Lock()
+			opengwCalls = append(opengwCalls, r.Method+" "+r.URL.Path)
+			mu.Unlock()
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(5 * time.Second)
+	c.snapBase = srv.URL
+	c.benefitBase = srv.URL
+	acct := &auth.Auth{UserID: "u-gate", UserName: "n", AccessKeyID: "AK", SecretAccessKey: "SK", CloudDragonTok: "ST"}
+
+	infos, err := c.FetchModels(acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 2 {
+		t.Fatalf("开关关闭时应只合并 agent+builtin 两路，got=%+v", infos)
+	}
+	mu.Lock()
+	gotOpengw, gotGate := append([]string(nil), opengwCalls...), gateCalls
+	mu.Unlock()
+	if len(gotOpengw) != 0 {
+		t.Fatalf("开关关闭时不该请求 opengw 的 claim/config，calls=%v", gotOpengw)
+	}
+	if gotGate != 1 {
+		t.Fatalf("应只查一次总开关，got=%d", gotGate)
+	}
+	// 渠道未开通是终态：第二次同步连开关都不该再查。
+	if _, err := c.FetchModels(acct); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	gotGate = gateCalls
+	mu.Unlock()
+	if gotGate != 1 {
+		t.Fatalf("已确认未开通后不应重复查询开关，got=%d", gotGate)
+	}
+}
+
+// 开关查询本身失败 = 问不到，不是「关闭」；应继续走原流程（对齐 Python 版 T14）。
+func TestBenefitGatewayQueryFailureDoesNotDisable(t *testing.T) {
+	var mu sync.Mutex
+	var configCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/benefit-gateway-config":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `boom`)
+		case "/v1/agent-center/agents/useragents":
+			_, _ = io.WriteString(w, `{"agents":[{"agent_id":"a1","is_primary_agent":true}]}`)
+		case "/v1/agent-center/agents/detail":
+			_, _ = io.WriteString(w, `{"gpts":{"models":[{"model_name":"GLM-5.2"}]}}`)
+		case "/v1/model/builtin":
+			_, _ = io.WriteString(w, `{"builtinModels":[]}`)
+		case "/api/v1/gateway/config":
+			mu.Lock()
+			configCalls++
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"error_code":"0000","result":{"models":[{"model_id":"glm-5.3-flash"}]}}`)
+		case "/api/v1/benefit/claim":
+			_, _ = io.WriteString(w, `{"error_code":"0000"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(5 * time.Second)
+	c.snapBase = srv.URL
+	c.benefitBase = srv.URL
+	acct := &auth.Auth{UserID: "u-flaky", UserName: "n", AccessKeyID: "AK", SecretAccessKey: "SK", CloudDragonTok: "ST"}
+
+	if _, err := c.FetchModels(acct); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got := configCalls
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("开关查询失败时仍应尝试 gateway/config，calls=%d", got)
+	}
+	if !IsBenefitModel("u-flaky", "glm-5.3-flash") {
+		t.Error("福利来源成功时模型应走福利路由")
+	}
+}
+
+// 总开关说开着、实际回 invalid channel：以实际上游行为为准，记住后不再重试。
+func TestBenefitChannelDownRemembered(t *testing.T) {
+	var mu sync.Mutex
+	var opengwCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/benefit-gateway-config":
+			_, _ = io.WriteString(w, `{"enabled":true}`)
+		case "/v1/agent-center/agents/useragents":
+			_, _ = io.WriteString(w, `{"agents":[{"agent_id":"a1","is_primary_agent":true}]}`)
+		case "/v1/agent-center/agents/detail":
+			_, _ = io.WriteString(w, `{"gpts":{"models":[{"model_name":"GLM-5.2"}]}}`)
+		case "/v1/model/builtin":
+			_, _ = io.WriteString(w, `{"builtinModels":[]}`)
+		case "/api/v1/benefit/claim":
+			mu.Lock()
+			opengwCalls++
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"error_code":"4000","error_msg":"invalid channel, group not found"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(5 * time.Second)
+	c.snapBase = srv.URL
+	c.benefitBase = srv.URL
+	acct := &auth.Auth{UserID: "u-down", UserName: "n", AccessKeyID: "AK", SecretAccessKey: "SK", CloudDragonTok: "ST"}
+
+	if _, err := c.FetchModels(acct); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	first := opengwCalls
+	mu.Unlock()
+	if first != 1 {
+		t.Fatalf("首次发现应尝试一次 claim，calls=%d", first)
+	}
+	// 渠道未开通是终态：后续同步直接跳过，不再撞 opengw。
+	if _, err := c.FetchModels(acct); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	second := opengwCalls
+	mu.Unlock()
+	if second != first {
+		t.Fatalf("已确认渠道未开通后不应再请求 opengw，calls=%d", second)
+	}
+	// 渠道未开通 → 目录里不该凭空多出福利模型（种子兜底是另一回事：
+	// IsBenefitModel 在目录查不到时会回退种子，见 TestBenefitIsPerAccount）。
+	models, _ := AccountModels("u-down")
+	for _, mi := range models {
+		if strings.EqualFold(mi.ID, "glm-5.3-flash") {
+			t.Errorf("渠道未开通时目录里不该出现福利模型，got=%+v", models)
+		}
+	}
+}

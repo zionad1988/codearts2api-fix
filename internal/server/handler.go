@@ -493,6 +493,11 @@ func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 			"context_length": ctx,
 		}
 		if maxOut > 0 {
+			// 对外上报的输出上限必须是上游真正接受的值，否则客户端会按云端
+			// 下发的上下文口径值（131072+）发请求，直接被 InferHub 判为非法参数。
+			if maxOut > upstream.MaxOutputTokens {
+				maxOut = upstream.MaxOutputTokens
+			}
 			entry["max_output_tokens"] = maxOut
 		}
 		if benefit {
@@ -587,9 +592,15 @@ func (h *Handler) pickAccount(tried map[string]bool, model string) *pool.Account
 	// 直接退回轮转的话，混合池里没有该模型的账号会先吃一次 400，白耗 MaxRotate
 	// （默认 3 次，账号多于 3 个时可能永远轮不到有能力的那台），还会给健康账号
 	// 记错误、到阈值冷却 10 分钟。所以先补齐缺失的目录再挑一次。
-	h.discoverMissingCatalogs(tried)
-	if acct := h.pickByCatalog(tried, want); acct != nil {
-		return acct
+	//
+	// 但只在「已有账号发现过目录」时补：冷启动全空时补齐等于让每个聊天请求都
+	// 同步打一遍模型发现（三路上游，慢且会失败），首个请求被硬拖住。先让请求
+	// 按乐观轮转走，目录由 /v1/models 或后台刷新补齐。
+	if h.anyCatalogKnown() {
+		h.discoverMissingCatalogs(tried)
+		if acct := h.pickByCatalog(tried, want); acct != nil {
+			return acct
+		}
 	}
 	return h.cfg.Pool.PickExcluding(tried)
 }
@@ -628,6 +639,49 @@ func (h *Handler) discoverMissingCatalogs(tried map[string]bool) {
 	}
 }
 
+// forcedSyncMinInterval 模型名查不到时强制同步的节流窗口。
+const forcedSyncMinInterval = 20 * time.Second
+
+var forcedSync struct {
+	sync.Mutex
+	last time.Time
+}
+
+// forceSyncModels 请求的模型不在任何账号目录里时，**同步**再发现一次。
+//
+// 为什么需要：fetchDynamicModels 的缓存是 1h，目录按 CatalogTTL 过期；福利模型
+// 是动态投放的，于是「上游刚放出某个模型」到「本地目录追上」之间有一段窗口，
+// 期间每次请求都会被判定成 model_not_found 直接 404（Python 版实测
+// 2026-10-14 05:01 那串 404 即此：模型 05:00:48 那次同步还没有，05:07:30 才进缓存）。
+//
+// 带节流：一个模型名查不到，可能是客户端配置写错了并在重试。没有这个窗口就会
+// 变成「每次坏请求都打一遍上游」。返回是否因此命中。
+func (h *Handler) forceSyncModels(model string) bool {
+	want := strings.ToLower(upstream.CanonicalModel(model))
+	forcedSync.Lock()
+	if time.Since(forcedSync.last) < forcedSyncMinInterval {
+		forcedSync.Unlock()
+		return false
+	}
+	forcedSync.last = time.Now()
+	forcedSync.Unlock()
+
+	log.Printf("model %s not in any catalog, forcing a sync", model)
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if acct == nil || acct.Auth == nil || !h.cfg.Pool.Healthy(acct.Name) {
+			continue
+		}
+		if _, err := h.cfg.Upstream.FetchModels(acct.Auth); err != nil {
+			log.Printf("forced model sync failed for account %s: %v", acct.Name, err)
+			continue
+		}
+		if models, ok := upstream.AccountModels(acct.UID); ok && catalogHas(models, want) {
+			return true
+		}
+	}
+	return false
+}
+
 // accountCanServe 报告账号目录里是否登记了该模型；账号不存在或目录未知时乐观放行
 // （交给上游判定，不凭缺失的目录拒请求）。
 func (h *Handler) accountCanServe(acct *pool.Account, model string) bool {
@@ -639,6 +693,33 @@ func (h *Handler) accountCanServe(acct *pool.Account, model string) bool {
 		return true
 	}
 	return catalogHas(models, strings.ToLower(upstream.CanonicalModel(model)))
+}
+
+// anyCatalogKnown 报告是否至少有一个健康账号已经发现过模型目录。
+func (h *Handler) anyCatalogKnown() bool {
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if acct == nil || !h.cfg.Pool.Healthy(acct.Name) {
+			continue
+		}
+		if _, known := upstream.AccountModels(acct.UID); known {
+			return true
+		}
+	}
+	return false
+}
+
+// anyCatalogHas 报告是否有任一健康账号的目录里登记了该模型。
+func (h *Handler) anyCatalogHas(model string) bool {
+	want := strings.ToLower(upstream.CanonicalModel(model))
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if acct == nil || !h.cfg.Pool.Healthy(acct.Name) {
+			continue
+		}
+		if models, known := upstream.AccountModels(acct.UID); known && catalogHas(models, want) {
+			return true
+		}
+	}
+	return false
 }
 
 // catalogHas 按小写 ID 在模型目录里查模型。
@@ -702,6 +783,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	msgs := buildUpstreamMessages(req, toolsOn)
 
+	// 请求的模型不在任何已发现目录里：先同步补一次发现再判定。
+	// 福利模型是动态投放的，后台刷新还没落地时本地会误判成「不存在」直接 404。
+	// 目录还没发现过的账号算「未知」，不触发（否则首启每个请求都打上游）。
+	if req.Model != "" && req.Model != "auto" && h.anyCatalogKnown() && !h.anyCatalogHas(model) {
+		if h.forceSyncModels(model) {
+			log.Printf("model %s hit after forced sync, continuing", model)
+		}
+	}
+
 	// 已经确认「所有健康账号都用不了这个模型」时直接快速失败：不必再打上游、
 	// 也不必把账号轮转一遍（轮转只会拿到同样的 not registered / benefit not found）。
 	if h.modelKnownUnusable(model) {
@@ -715,17 +805,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		var acct *pool.Account
 		if stickyAcct != "" {
-			// 续接会话：锁定原账号（若仍健康）。
+			// 续接会话：锁定原账号（仍健康且目录里有这个模型）。
 			acct = h.cfg.Pool.Get(stickyAcct)
-			if acct == nil || !h.cfg.Pool.Healthy(stickyAcct) {
+			if acct == nil || !h.cfg.Pool.Healthy(stickyAcct) || !h.accountCanServe(acct, model) {
 				stickyAcct = ""
-				acct = h.cfg.Pool.PickExcluding(tried)
+				acct = h.pickAccount(tried, model)
 			} else {
 				tried[acct.Name] = true
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			acct = h.pickAccount(tried, model)
 		}
 		if acct == nil {
 			break
